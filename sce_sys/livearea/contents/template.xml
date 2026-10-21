@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<livearea style="ad0" format-ver="01.00" content-rev="1">
+  <livearea-background>
+    <image>bg0.png</image>
+  </livearea-background>
+  <frame id="frame1" multi="o" autoflip="0" rev="1">
+    <liveitem default="on">
+      <image align="center" valign="center" origin="frame" width="647" height="109" x="0" y="55">frame1.png</image>
+      <target>psla:eboot</target>
+    </liveitem>
+  </frame>
+</livearea>
