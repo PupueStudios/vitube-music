@@ -94,6 +94,9 @@ static vita2d_pgf *g_font;
 static GfxFont *g_ps;
 static vita2d_texture *g_glow;
 static vita2d_texture *g_logo;
+static vita2d_texture *g_heart;
+static vita2d_texture *g_heart_s;
+static vita2d_texture *g_note;
 static float g_lh = 20.0f;
 static float g_alpha = 1.0f;
 static float g_dt = 1.0f / 60.0f;
@@ -129,6 +132,11 @@ static int t_x0;
 static int t_y0;
 static int t_ly;
 static int t_accum;
+static int t_scrub;
+static float g_scrub_frac;
+static int g_seek_target = -1;
+static int g_seek_dur;
+static uint32_t g_seek_until;
 
 static int in_hangul(unsigned int c) {
     return (c >= 0xAC00 && c <= 0xD7AF) || (c >= 0x1100 && c <= 0x11FF) || (c >= 0x3130 && c <= 0x318F);
@@ -301,11 +309,16 @@ static void icon_prev(float cx, float cy, float s, unsigned color) {
     gfx_rounded_rect(cx - s * 0.5f, cy - s * 0.5f, s * 0.2f, s, 1.0f, color);
 }
 
+static void icon_tex(vita2d_texture *tex, float cx, float cy, float s, unsigned color) {
+    if (!tex) return;
+    float w = (float)vita2d_texture_get_width(tex);
+    float h = (float)vita2d_texture_get_height(tex);
+    float sc = s / (w > h ? w : h);
+    vita2d_draw_texture_tint_scale(tex, cx - w * sc * 0.5f, cy - h * sc * 0.5f, sc, sc, color);
+}
+
 static void icon_heart(float cx, float cy, float s, unsigned color) {
-    float r = s * 0.27f;
-    vita2d_draw_fill_circle(cx - r * 0.95f, cy - s * 0.14f, r, color);
-    vita2d_draw_fill_circle(cx + r * 0.95f, cy - s * 0.14f, r, color);
-    tri_down(cx, cy - s * 0.12f, r * 4.0f - 1.0f, s * 0.68f, color);
+    icon_tex(s <= 24.0f ? g_heart_s : g_heart, cx, cy, s, color);
 }
 
 static void icon_search(float cx, float cy, float s, unsigned color) {
@@ -320,9 +333,7 @@ static void icon_search(float cx, float cy, float s, unsigned color) {
 }
 
 static void icon_note(float cx, float cy, float s, unsigned color) {
-    vita2d_draw_fill_circle(cx - s * 0.18f, cy + s * 0.28f, s * 0.2f, color);
-    vita2d_draw_rectangle(cx - s * 0.02f, cy - s * 0.4f, s * 0.1f, s * 0.7f, color);
-    vita2d_draw_rectangle(cx - s * 0.02f, cy - s * 0.4f, s * 0.34f, s * 0.12f, color);
+    icon_tex(g_note, cx, cy, s, color);
 }
 
 static void draw_eq(float cx, float cy, float s, int live, unsigned color) {
@@ -457,12 +468,7 @@ static void draw_empty(void) {
     else icon_play(cx, cy, 28.0f, C(255, 255, 255, 0.85));
 
     if (searching) {
-        float w = tw(FS_L, msg);
-        tx(cx - w * 0.5f - 12.0f, cy + 78.0f, FS_L, C(255, 255, 255, 0.92), msg);
-        for (int i = 0; i < 3; i++) {
-            float k = 0.5f + 0.5f * sinf(g_t * 7.0f - (float)i * 0.9f);
-            vita2d_draw_fill_circle(cx + w * 0.5f - 4.0f + (float)i * 10.0f, cy + 85.0f, 2.2f + 1.2f * k, C(RED, 0.4f + 0.6f * k));
-        }
+        tx_center(cx, cy + 78.0f, FS_L, C(255, 255, 255, 0.92), msg);
     } else if (err) {
         tx_fit(cx - 330.0f, cy + 78.0f, 660.0f, FS_M, C(255, 110, 120, 1.0), msg);
         tx_center(cx, cy + 104.0f, FS_XS, C(255, 255, 255, 0.50), "Press SELECT to try again");
@@ -651,9 +657,15 @@ static void draw_footer(void) {
     int pos = player_position_ms();
     int dur = player_duration_ms();
     if (st == PL_LOADING || st == PL_ERROR || st == PL_IDLE) pos = 0;
+    if (t_scrub && dur > 0) {
+        pos = (int)(g_scrub_frac * (float)dur);
+    } else if (g_seek_target >= 0) {
+        if (now_ms() > g_seek_until || dur != g_seek_dur || abs(pos - g_seek_target) < 1500) g_seek_target = -1;
+        else pos = g_seek_target;
+    }
     float frac = 0.0f;
     if (dur > 0 && has) frac = gfx_clamp01(pos / (float)dur);
-    if (fabsf(frac - g_prog) > 0.2f) g_prog = frac;
+    if (t_scrub || fabsf(frac - g_prog) > 0.2f) g_prog = frac;
     else g_prog += (frac - g_prog) * SMOOTH(18.0f);
 
     float by = PB_Y + oy;
@@ -663,7 +675,7 @@ static void draw_footer(void) {
         if (fw < 5.0f) fw = 5.0f;
         gfx_rounded_rect_vgrad(PB_X, by - 2.5f, fw, 5.0f, 2.5f, C(255, 84, 96, 1.0), C(RED, 1.0));
         gfx_draw_glow(g_glow, PB_X + fw, by, 20.0f, RED, 0.55f * g_alpha);
-        vita2d_draw_fill_circle(PB_X + fw, by, 6.5f, C(255, 255, 255, 1.0));
+        vita2d_draw_fill_circle(PB_X + fw, by, t_scrub ? 9.0f : 6.5f, C(255, 255, 255, 1.0));
     }
 
     char a[24] = "0:00";
@@ -752,6 +764,7 @@ static void render_black(void) {
 
 static void set_screen_off(int off) {
     t_down = 0;
+    t_scrub = 0;
     if (!off) {
         g_last_frame = 0;
         g_intro = 0.35f;
@@ -968,6 +981,15 @@ static void handle_tap(int x, int y) {
     if (near_pt(x, y, CTL_PLAY_X, CTL_CY, 32.0f)) player_toggle_pause();
 }
 
+static float scrub_frac_at(int x) {
+    return gfx_clamp01((float)(x - PB_X) / (float)PB_W);
+}
+
+static int can_seek(void) {
+    pl_state_t st = player_state();
+    return player_duration_ms() > 0 && (st == PL_PLAYING || st == PL_PAUSED);
+}
+
 static void handle_touch(void) {
     SceTouchData td;
     memset(&td, 0, sizeof td);
@@ -982,7 +1004,13 @@ static void handle_touch(void) {
             t_y0 = y;
             t_ly = y;
             t_accum = 0;
+            t_scrub = 0;
+            if (y >= PB_Y - 24 && y <= PB_Y + 24 && x >= PB_X - 16 && x <= PB_X + PB_W + 16 && can_seek()) {
+                t_scrub = 1;
+                g_scrub_frac = scrub_frac_at(x);
+            }
         } else {
+            if (t_scrub) g_scrub_frac = scrub_frac_at(x);
             int dx = x - t_x0;
             int dy = y - t_y0;
             if (!t_moved && (dx * dx + dy * dy) > 14 * 14) t_moved = 1;
@@ -1004,7 +1032,19 @@ static void handle_touch(void) {
         }
     } else if (t_down) {
         t_down = 0;
-        if (!t_moved) handle_tap(t_x0, t_y0);
+        if (t_scrub) {
+            t_scrub = 0;
+            int dur = player_duration_ms();
+            if (dur > 0) {
+                int ms = (int)(g_scrub_frac * (float)dur);
+                player_seek_abs(ms);
+                g_seek_target = ms;
+                g_seek_dur = dur;
+                g_seek_until = now_ms() + 4000;
+            }
+        } else if (!t_moved) {
+            handle_tap(t_x0, t_y0);
+        }
     }
 }
 
@@ -1104,6 +1144,12 @@ int ui_init(void) {
     g_glow = gfx_make_glow(128);
     g_logo = vita2d_load_PNG_file("app0:assets/Logo.png");
     vita2d_texture_set_filters(g_logo, SCE_GXM_TEXTURE_FILTER_LINEAR, SCE_GXM_TEXTURE_FILTER_LINEAR);
+    g_heart = vita2d_load_PNG_file("app0:assets/Heart.png");
+    g_heart_s = vita2d_load_PNG_file("app0:assets/Heart_s.png");
+    g_note = vita2d_load_PNG_file("app0:assets/Note.png");
+    if (g_heart) vita2d_texture_set_filters(g_heart, SCE_GXM_TEXTURE_FILTER_LINEAR, SCE_GXM_TEXTURE_FILTER_LINEAR);
+    if (g_heart_s) vita2d_texture_set_filters(g_heart_s, SCE_GXM_TEXTURE_FILTER_LINEAR, SCE_GXM_TEXTURE_FILTER_LINEAR);
+    if (g_note) vita2d_texture_set_filters(g_note, SCE_GXM_TEXTURE_FILTER_LINEAR, SCE_GXM_TEXTURE_FILTER_LINEAR);
     flies_init();
 
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG);
@@ -1152,6 +1198,9 @@ void ui_shutdown(void) {
     if (g_art) vita2d_free_texture(g_art);
     if (g_glow) vita2d_free_texture(g_glow);
     vita2d_free_texture(g_logo);
+    if (g_heart) vita2d_free_texture(g_heart);
+    if (g_heart_s) vita2d_free_texture(g_heart_s);
+    if (g_note) vita2d_free_texture(g_note);
     gfx_font_free(g_ps);
     if (g_font) vita2d_free_pgf(g_font);
     vita2d_fini();

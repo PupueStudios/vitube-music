@@ -101,6 +101,9 @@ vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
   FILE assets/cacert.pem data/cacert.pem
   FILE assets/PSButtons.ttf assets/PSButtons.ttf
   FILE assets/Logo.png assets/Logo.png
+  FILE assets/Heart.png assets/Heart.png
+  FILE assets/Heart_s.png assets/Heart_s.png
+  FILE assets/Note.png assets/Note.png
   FILE sce_sys/icon0.png sce_sys/icon0.png
   FILE sce_sys/livearea/contents/bg0.png sce_sys/livearea/contents/bg0.png
   FILE sce_sys/livearea/contents/frame1.png sce_sys/livearea/contents/frame1.png
