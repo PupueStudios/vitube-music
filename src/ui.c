@@ -16,9 +16,11 @@
 #include <psp2/touch.h>
 #include <vita2d.h>
 
+#include "dl.h"
 #include "font.h"
 #include "gfx.h"
 #include "jobs.h"
+#include "thumbs.h"
 #include "net.h"
 #include "player.h"
 #include "store.h"
@@ -28,8 +30,8 @@
 #define CHIP_Y 14
 #define CHIP_H 36
 #define CHIP_X0 84
-#define CHIP_PAD 20
-#define CHIP_GAP 10
+#define CHIP_PAD 14
+#define CHIP_GAP 8
 
 #define LIST_Y 72
 #define ROW_PITCH 60
@@ -75,9 +77,49 @@ enum {
     TAB_SEARCH = 0,
     TAB_QUEUE,
     TAB_FAVS,
+    TAB_PLAYLISTS,
+    TAB_OFFLINE,
     TAB_HIST,
     TAB_COUNT
 };
+
+#define MENU_MAX 72
+#define MENU_VIS 6
+#define MENU_ITEM_H 42
+#define MENU_TITLE_H 50
+#define MENU_W 460
+
+enum {
+    MENU_NONE = 0,
+    MENU_SONG,
+    MENU_PICK,
+    MENU_PL,
+    MENU_CONFIRM
+};
+
+enum {
+    ACT_ADD_PL = 1,
+    ACT_DOWNLOAD,
+    ACT_REMOVE_DL,
+    ACT_QUEUE,
+    ACT_REMOVE_FROM_PL,
+    ACT_PICK_PL,
+    ACT_NEW_PL_ADD,
+    ACT_PL_PLAY,
+    ACT_PL_DL_ALL,
+    ACT_PL_RENAME,
+    ACT_PL_DELETE,
+    ACT_PL_DELETE_YES,
+    ACT_Q_REMOVE,
+    ACT_Q_TRIM,
+    ACT_CLOSE
+};
+
+typedef struct {
+    char label[80];
+    int act;
+    int arg;
+} menu_item_t;
 
 typedef struct {
     float x, y, speed, phase, size, sway;
@@ -88,7 +130,7 @@ typedef struct {
     const char *label;
 } hint_t;
 
-static const char *const TAB_NAMES[TAB_COUNT] = {"Search", "Queue", "Favorites", "History"};
+static const char *const TAB_NAMES[TAB_COUNT] = {"Search", "Queue", "Favorites", "Playlists", "Offline", "History"};
 
 static vita2d_pgf *g_font;
 static GfxFont *g_ps;
@@ -97,6 +139,7 @@ static vita2d_texture *g_logo;
 static vita2d_texture *g_heart;
 static vita2d_texture *g_heart_s;
 static vita2d_texture *g_note;
+static vita2d_texture *g_search;
 static float g_lh = 20.0f;
 static float g_alpha = 1.0f;
 static float g_dt = 1.0f / 60.0f;
@@ -133,6 +176,22 @@ static int t_y0;
 static int t_ly;
 static int t_accum;
 static int t_scrub;
+static int t_long;
+static uint32_t t_since;
+static uint32_t g_tri_since;
+static int g_tri_fired;
+static int g_pl_open = -1;
+static struct {
+    int kind;
+    int sel;
+    int top;
+    int n;
+    int pl;
+    uint32_t t0;
+    char title[96];
+    menu_item_t it[MENU_MAX];
+    track_t song;
+} g_menu;
 static float g_scrub_frac;
 static int g_seek_target = -1;
 static int g_seek_dur;
@@ -160,6 +219,11 @@ static void toast(const char *fmt, ...) {
     g_toast_until = g_toast_from + 2800;
 }
 
+static int playlist_valid(void) {
+    if (g_pl_open >= store_pl_count()) g_pl_open = -1;
+    return g_pl_open;
+}
+
 static int tab_count(int tab) {
     switch (tab) {
     case TAB_SEARCH:
@@ -168,9 +232,39 @@ static int tab_count(int tab) {
         return player_queue_count();
     case TAB_FAVS:
         return store_fav_count();
+    case TAB_PLAYLISTS:
+        return playlist_valid() < 0 ? 1 + store_pl_count() : 1 + store_pl_track_count(g_pl_open);
+    case TAB_OFFLINE:
+        return store_dl_count();
     default:
         return store_hist_count();
     }
+}
+
+static int playlist_row(int i, track_t *t) {
+    memset(t, 0, sizeof *t);
+    str_set(t->id, sizeof t->id, "ui:ctl");
+    char name[64];
+    if (playlist_valid() < 0) {
+        if (i == 0) {
+            str_set(t->title, sizeof t->title, "New playlist");
+            str_set(t->artist, sizeof t->artist, "Press X or tap to create one");
+            return 1;
+        }
+        int n = store_pl_name(i - 1, name, sizeof name);
+        if (n < 0) return 0;
+        str_set(t->title, sizeof t->title, name);
+        if (n == 1) snprintf(t->artist, sizeof t->artist, "1 song");
+        else snprintf(t->artist, sizeof t->artist, "%d songs", n);
+        return 1;
+    }
+    if (i == 0) {
+        store_pl_name(g_pl_open, name, sizeof name);
+        str_set(t->title, sizeof t->title, "Back to playlists");
+        str_set(t->artist, sizeof t->artist, name);
+        return 1;
+    }
+    return store_pl_track_get(g_pl_open, i - 1, t);
 }
 
 static int tab_get(int tab, int i, track_t *t) {
@@ -181,9 +275,21 @@ static int tab_get(int tab, int i, track_t *t) {
         return player_queue_get(i, t);
     case TAB_FAVS:
         return store_fav_get(i, t);
+    case TAB_PLAYLISTS:
+        return playlist_row(i, t);
+    case TAB_OFFLINE:
+        return store_dl_get(i, t);
     default:
         return store_hist_get(i, t);
     }
+}
+
+static int get_song(int tab, int idx, track_t *t) {
+    if (tab == TAB_PLAYLISTS) {
+        if (playlist_valid() < 0 || idx < 1) return 0;
+        return store_pl_track_get(g_pl_open, idx - 1, t);
+    }
+    return tab_get(tab, idx, t);
 }
 
 static void fmt_time(char *out, size_t cap, int ms) {
@@ -309,6 +415,12 @@ static void icon_prev(float cx, float cy, float s, unsigned color) {
     gfx_rounded_rect(cx - s * 0.5f, cy - s * 0.5f, s * 0.2f, s, 1.0f, color);
 }
 
+static void icon_download(float cx, float cy, float s, unsigned color) {
+    vita2d_draw_rectangle(cx - s * 0.09f, cy - s * 0.42f, s * 0.18f, s * 0.42f, color);
+    tri_down(cx, cy, s * 0.66f, s * 0.34f, color);
+    vita2d_draw_rectangle(cx - s * 0.36f, cy + s * 0.42f, s * 0.72f, s * 0.09f, color);
+}
+
 static void icon_tex(vita2d_texture *tex, float cx, float cy, float s, unsigned color) {
     if (!tex) return;
     float w = (float)vita2d_texture_get_width(tex);
@@ -322,14 +434,7 @@ static void icon_heart(float cx, float cy, float s, unsigned color) {
 }
 
 static void icon_search(float cx, float cy, float s, unsigned color) {
-    float r = s * 0.36f;
-    gfx_rounded_ring(cx - r - s * 0.1f, cy - r - s * 0.1f, r * 2.0f, r * 2.0f, r, 2.2f, color);
-    float x0 = cx + r * 0.62f;
-    float y0 = cy + r * 0.62f;
-    for (int i = -1; i <= 1; i++) {
-        vita2d_draw_line(x0 + (float)i * 0.7f, y0 - (float)i * 0.7f, x0 + s * 0.42f + (float)i * 0.7f,
-                         y0 + s * 0.42f - (float)i * 0.7f, color);
-    }
+    icon_tex(g_search, cx, cy, s, color);
 }
 
 static void icon_note(float cx, float cy, float s, unsigned color) {
@@ -400,7 +505,7 @@ static void draw_header(void) {
     if (jobs_search_busy()) {
         for (int i = 0; i < 3; i++) {
             float k = 0.5f + 0.5f * sinf(g_t * 7.0f - (float)i * 0.9f);
-            vita2d_draw_fill_circle(690.0f + (float)i * 14.0f, 32.0f, 3.0f + 1.5f * k, C(RED, 0.4f + 0.6f * k));
+            vita2d_draw_fill_circle(716.0f + (float)i * 12.0f, 32.0f, 3.0f + 1.5f * k, C(RED, 0.4f + 0.6f * k));
         }
     }
 
@@ -413,6 +518,16 @@ static void draw_header(void) {
     float bx = SCREEN_W - 20.0f;
     tx_right(bx, 32.0f, FS_XS, C(255, 255, 255, 0.62), b);
     float ix = bx - tw(FS_XS, b) - 38.0f;
+    dl_status_t ds;
+    dl_status(&ds);
+    if (ds.active || ds.pending > 0) {
+        char dtxt[48];
+        if (ds.pending > 0) snprintf(dtxt, sizeof dtxt, "%d%%  +%d", ds.pct, ds.pending);
+        else snprintf(dtxt, sizeof dtxt, "%d%%", ds.pct);
+        float drx = ix - 18.0f;
+        tx_right(drx, 32.0f, FS_XS, C(255, 255, 255, 0.70), dtxt);
+        icon_download(drx - tw(FS_XS, dtxt) - 14.0f, 32.0f, 14.0f, C(120, 220, 150, 0.95));
+    }
     gfx_rounded_ring(ix, 25.5f, 26.0f, 13.0f, 4.0f, 1.5f, C(255, 255, 255, 0.55));
     vita2d_draw_rectangle(ix + 26.0f, 29.0f, 2.0f, 6.0f, C(255, 255, 255, 0.55));
     float fw = 20.0f * (float)pct / 100.0f;
@@ -449,6 +564,11 @@ static void draw_empty(void) {
     } else if (g_tab == TAB_FAVS) {
         snprintf(msg, sizeof msg, "No favorites yet");
         snprintf(sub, sizeof sub, "Press TRIANGLE on a song to save it");
+    } else if (g_tab == TAB_OFFLINE) {
+        snprintf(msg, sizeof msg, "No downloads yet");
+        snprintf(sub, sizeof sub, "Hold TRIANGLE on a song and pick Download");
+    } else if (g_tab == TAB_PLAYLISTS) {
+        snprintf(msg, sizeof msg, "No playlists yet");
     } else {
         snprintf(msg, sizeof msg, "Nothing played yet");
         snprintf(sub, sizeof sub, "Songs you play will show up here");
@@ -465,6 +585,8 @@ static void draw_empty(void) {
     if (g_tab == TAB_SEARCH) icon_search(cx, cy, 36.0f, C(255, 255, 255, 0.85));
     else if (g_tab == TAB_QUEUE) icon_note(cx, cy, 36.0f, C(255, 255, 255, 0.85));
     else if (g_tab == TAB_FAVS) icon_heart(cx, cy + 1.0f, 36.0f, C(255, 255, 255, 0.85));
+    else if (g_tab == TAB_OFFLINE) icon_download(cx, cy - 1.0f, 34.0f, C(255, 255, 255, 0.85));
+    else if (g_tab == TAB_PLAYLISTS) icon_note(cx, cy, 36.0f, C(255, 255, 255, 0.85));
     else icon_play(cx, cy, 28.0f, C(255, 255, 255, 0.85));
 
     if (searching) {
@@ -478,6 +600,15 @@ static void draw_empty(void) {
     }
 }
 
+static void draw_thumb_tex(vita2d_texture *tex, float x, float y, float size, float alpha) {
+    float w = (float)vita2d_texture_get_width(tex);
+    float h = (float)vita2d_texture_get_height(tex);
+    float side = w < h ? w : h;
+    float sc = size / side;
+    vita2d_draw_texture_tint_part_scale(tex, x, y, (w - side) * 0.5f, (h - side) * 0.5f, side, side, sc, sc,
+                                        gfx_color(255, 255, 255, alpha));
+}
+
 static void draw_row(int idx, const track_t *t, float y, int sel) {
     int playing = is_current_track(t);
     pl_state_t st = player_state();
@@ -485,17 +616,25 @@ static void draw_row(int idx, const track_t *t, float y, int sel) {
     float ty = y + (ROW_H - THUMB) * 0.5f;
 
     gfx_rounded_rect(x, ty, THUMB, THUMB, 8.0f, C(255, 255, 255, 0.07));
+    float fade = 1.0f;
+    vita2d_texture *tt = thumbs_get(t, &fade);
+    int have_art = 0;
+    if (playing && g_art && strcmp(g_art_id, t->id) == 0) {
+        float sx = THUMB / (float)vita2d_texture_get_width(g_art);
+        float sy = THUMB / (float)vita2d_texture_get_height(g_art);
+        vita2d_draw_texture_tint_scale(g_art, x, ty, sx, sy, gfx_color(255, 255, 255, g_alpha));
+        have_art = 1;
+    } else if (tt) {
+        draw_thumb_tex(tt, x, ty, THUMB, g_alpha * fade);
+        have_art = 1;
+    }
     if (playing) {
-        if (g_art && strcmp(g_art_id, t->id) == 0) {
-            float sx = THUMB / (float)vita2d_texture_get_width(g_art);
-            float sy = THUMB / (float)vita2d_texture_get_height(g_art);
-            vita2d_draw_texture_tint_scale(g_art, x, ty, sx, sy, gfx_color(255, 255, 255, g_alpha));
-        }
         vita2d_draw_rectangle(x, ty, THUMB, THUMB, C(0, 0, 0, 0.45));
         draw_eq(x + THUMB * 0.5f, ty + THUMB * 0.5f, 18.0f, st == PL_PLAYING, C(255, 255, 255, 0.96));
-    } else {
+    } else if (!have_art) {
         char n[12];
-        snprintf(n, sizeof n, "%d", idx + 1);
+        if (g_tab == TAB_PLAYLISTS && idx == 0) snprintf(n, sizeof n, "%s", g_pl_open < 0 ? "+" : "<");
+        else snprintf(n, sizeof n, "%d", g_tab == TAB_PLAYLISTS ? idx : idx + 1);
         tx_center(x + THUMB * 0.5f, ty + THUMB * 0.5f, FS_S, C(255, 255, 255, sel ? 0.75 : 0.42), n);
     }
 
@@ -505,9 +644,13 @@ static void draw_row(int idx, const track_t *t, float y, int sel) {
     float dw = dur[0] ? tw(FS_S, dur) : 0.0f;
     if (dur[0]) tx_right(right, y + ROW_H * 0.5f, FS_S, C(255, 255, 255, sel ? 0.78 : 0.55), dur);
     float lim = right - dw;
+    if (store_dl_find(t->id, NULL, NULL)) {
+        icon_download(lim - 14.0f, y + ROW_H * 0.5f, 13.0f, C(120, 220, 150, 0.95));
+        lim -= 28.0f;
+    }
     if (store_is_fav(t->id)) {
-        icon_heart(right - dw - 22.0f, y + ROW_H * 0.5f, 16.0f, C(255, 82, 102, 1.0));
-        lim = right - dw - 42.0f;
+        icon_heart(lim - 22.0f, y + ROW_H * 0.5f, 16.0f, C(255, 82, 102, 1.0));
+        lim -= 42.0f;
     }
 
     float tx0 = x + THUMB + 16.0f;
@@ -689,18 +832,41 @@ static void draw_footer(void) {
     g_alpha = 1.0f;
 }
 
+static int build_hints(hint_t *h) {
+    int n = 0;
+    if (g_menu.kind) {
+        h[n++] = (hint_t){"34", "Move"};
+        h[n++] = (hint_t){"x", "Select"};
+        h[n++] = (hint_t){"c", "Close"};
+        return n;
+    }
+    int top_pl = g_tab == TAB_PLAYLISTS && playlist_valid() < 0;
+    h[n++] = (hint_t){"34", "Move"};
+    h[n++] = (hint_t){"21", "Tabs"};
+    h[n++] = (hint_t){"x", g_tab == TAB_PLAYLISTS && top_pl ? "Open" : "Play"};
+    if (g_tab == TAB_QUEUE) h[n++] = (hint_t){"c", "Remove"};
+    else if (g_tab == TAB_PLAYLISTS) {
+        if (!top_pl) h[n++] = (hint_t){"c", "Back"};
+    } else {
+        h[n++] = (hint_t){"c", "Queue"};
+    }
+    h[n++] = (hint_t){"s", "Pause"};
+    h[n++] = (hint_t){"t", top_pl ? "Hold: Menu" : "Fav / hold: Menu"};
+    h[n++] = (hint_t){"lr", "Skip"};
+    h[n++] = (hint_t){"b", "Search"};
+    h[n++] = (hint_t){"a", "Screen off"};
+    return n;
+}
+
 static void draw_hints(void) {
-    static const hint_t h[] = {
-        {"34", "Move"}, {"21", "Tabs"}, {"x", "Play"},   {"c", "Queue"},
-        {"s", "Pause"}, {"t", "Favorite"}, {"lr", "Skip"}, {"b", "Search"}, {"a", "Screen off"},
-    };
-    const int n = (int)(sizeof h / sizeof h[0]);
+    hint_t h[12];
+    const int n = build_hints(h);
     float e = gfx_ease_out_cubic(gfx_clamp01(g_intro));
     g_alpha = e;
 
     const float igap = 6.0f;
     const float gap = 20.0f;
-    float iw[9];
+    float iw[12];
     float total = 0.0f;
     for (int i = 0; i < n; i++) {
         iw[i] = (float)gfx_font_width(g_ps, PS_SIZE, h[i].glyphs);
@@ -744,6 +910,54 @@ static void draw_toast(void) {
     g_alpha = 1.0f;
 }
 
+static void menu_geom(float *px, float *py, float *ph, int *vis) {
+    int v = g_menu.n < MENU_VIS ? g_menu.n : MENU_VIS;
+    float h = MENU_TITLE_H + (float)v * MENU_ITEM_H + 16.0f;
+    *px = (SCREEN_W - MENU_W) * 0.5f;
+    *py = (SCREEN_H - h) * 0.5f - 18.0f;
+    *ph = h;
+    *vis = v;
+}
+
+static void draw_menu(void) {
+    if (!g_menu.kind) return;
+    float a = gfx_ease_out_cubic(gfx_clamp01((float)(now_ms() - g_menu.t0) / 160.0f));
+    g_alpha = a;
+    vita2d_draw_rectangle(0.0f, 0.0f, SCREEN_W, SCREEN_H, C(0, 0, 0, 0.62));
+    float px, py, ph;
+    int vis;
+    menu_geom(&px, &py, &ph, &vis);
+    py += (1.0f - a) * 12.0f;
+    gfx_draw_glow(g_glow, SCREEN_W * 0.5f, py + ph * 0.5f, MENU_W * 0.75f, 0, 0, 0, 0.5f * a);
+    glass(px, py, MENU_W, ph, 22.0f, 0.99f, 0.99f, 0.16f);
+    tx_fit(px + 26.0f, py + 27.0f, MENU_W - 52.0f, FS_L, C(255, 255, 255, 0.98), g_menu.title);
+    vita2d_draw_rectangle(px + 22.0f, py + MENU_TITLE_H - 6.0f, MENU_W - 44.0f, 1.0f, C(255, 255, 255, 0.10));
+
+    float iy = py + MENU_TITLE_H;
+    for (int k = 0; k < vis; k++) {
+        int idx = g_menu.top + k;
+        if (idx >= g_menu.n) break;
+        float y = iy + (float)k * MENU_ITEM_H;
+        int on = idx == g_menu.sel;
+        if (on) {
+            gfx_rounded_rect_vgrad(px + 10.0f, y, MENU_W - 20.0f, MENU_ITEM_H - 4.0f, 14.0f, C(255, 255, 255, 0.16), C(255, 255, 255, 0.06));
+            gfx_rounded_rect(px + 18.0f, y + (MENU_ITEM_H - 4.0f - 20.0f) * 0.5f, 4.0f, 20.0f, 2.0f, C(RED, 1.0));
+        }
+        int danger = g_menu.it[idx].act == ACT_PL_DELETE || g_menu.it[idx].act == ACT_PL_DELETE_YES;
+        unsigned col = danger ? C(255, 110, 120, on ? 1.0 : 0.85) : C(255, 255, 255, on ? 1.0 : 0.80);
+        tx_fit(px + 36.0f, y + (MENU_ITEM_H - 4.0f) * 0.5f, MENU_W - 72.0f, FS_M, col, g_menu.it[idx].label);
+    }
+    if (g_menu.n > vis) {
+        float th = (float)vis * MENU_ITEM_H - 8.0f;
+        float bh = th * (float)vis / (float)g_menu.n;
+        if (bh < 20.0f) bh = 20.0f;
+        float f = gfx_clamp01((float)g_menu.top / (float)(g_menu.n - vis));
+        gfx_rounded_rect(px + MENU_W - 12.0f, iy + 2.0f, 3.0f, th, 1.5f, C(255, 255, 255, 0.06));
+        gfx_rounded_rect(px + MENU_W - 12.0f, iy + 2.0f + (th - bh) * f, 3.0f, bh, 1.5f, C(255, 255, 255, 0.35));
+    }
+    g_alpha = 1.0f;
+}
+
 static void draw_all(void) {
     g_alpha = 1.0f;
     draw_background();
@@ -751,6 +965,7 @@ static void draw_all(void) {
     draw_list();
     draw_footer();
     draw_hints();
+    draw_menu();
     draw_toast();
 }
 
@@ -765,6 +980,7 @@ static void render_black(void) {
 static void set_screen_off(int off) {
     t_down = 0;
     t_scrub = 0;
+    t_long = 0;
     if (!off) {
         g_last_frame = 0;
         g_intro = 0.35f;
@@ -870,15 +1086,90 @@ static void select_tab(int tab) {
     if (tab != g_tab) set_tab(tab, tab > g_tab ? 1.0f : -1.0f);
 }
 
+static track_t *pl_gather(int pl, int *m) {
+    int n = store_pl_track_count(pl);
+    *m = 0;
+    if (n <= 0) return NULL;
+    track_t *arr = malloc(sizeof(track_t) * (size_t)n);
+    if (!arr) return NULL;
+    for (int i = 0; i < n; i++)
+        if (store_pl_track_get(pl, i, &arr[*m])) (*m)++;
+    if (*m == 0) {
+        free(arr);
+        return NULL;
+    }
+    return arr;
+}
+
+static int prompt_new_playlist(const track_t *add) {
+    char name[64];
+    if (!ime_run("New playlist", "", name, sizeof name)) return -1;
+    int pl = store_pl_create(name);
+    if (pl < 0) {
+        toast("Could not create the playlist");
+        return -1;
+    }
+    char shown[64];
+    store_pl_name(pl, shown, sizeof shown);
+    if (add) {
+        if (store_pl_add(pl, add) > 0) toast("Added to %s", shown);
+        else toast("Created %s", shown);
+    } else {
+        toast("Created %s", shown);
+    }
+    if (playlist_valid() < 0) {
+        g_sel[TAB_PLAYLISTS] = pl + 1;
+        ensure_visible(TAB_PLAYLISTS);
+    }
+    return pl;
+}
+
+static void playlist_activate(int idx) {
+    if (playlist_valid() < 0) {
+        if (idx == 0) {
+            prompt_new_playlist(NULL);
+            return;
+        }
+        g_pl_open = idx - 1;
+        g_sel[TAB_PLAYLISTS] = store_pl_track_count(g_pl_open) > 0 ? 1 : 0;
+        g_top[TAB_PLAYLISTS] = 0;
+        g_hl[TAB_PLAYLISTS] = (float)g_sel[TAB_PLAYLISTS];
+        g_scroll[TAB_PLAYLISTS] = 0.0f;
+        return;
+    }
+    if (idx == 0) {
+        int was = g_pl_open;
+        g_pl_open = -1;
+        g_sel[TAB_PLAYLISTS] = was + 1;
+        g_top[TAB_PLAYLISTS] = 0;
+        ensure_visible(TAB_PLAYLISTS);
+        g_hl[TAB_PLAYLISTS] = (float)g_sel[TAB_PLAYLISTS];
+        g_scroll[TAB_PLAYLISTS] = (float)g_top[TAB_PLAYLISTS];
+        return;
+    }
+    int m = 0;
+    track_t *arr = pl_gather(g_pl_open, &m);
+    if (!arr) return;
+    int start = idx - 1 < m ? idx - 1 : 0;
+    player_set_radio(0);
+    player_queue_set(arr, m, start);
+    free(arr);
+}
+
 static void play_at(int tab, int idx) {
     int n = tab_count(tab);
     if (idx < 0 || idx >= n) return;
+    if (tab == TAB_PLAYLISTS) {
+        playlist_activate(idx);
+        return;
+    }
     track_t t;
     if (!tab_get(tab, idx, &t)) return;
     if (tab == TAB_QUEUE) {
         player_play_index(idx);
         return;
     }
+    player_set_radio(tab != TAB_OFFLINE);
     if (tab == TAB_SEARCH) {
         player_queue_set(&t, 1, 0);
         return;
@@ -896,16 +1187,225 @@ static void play_at(int tab, int idx) {
 static void add_selected_to_queue(void) {
     if (g_tab == TAB_QUEUE) return;
     track_t t;
-    if (!tab_get(g_tab, g_sel[g_tab], &t)) return;
+    if (!get_song(g_tab, g_sel[g_tab], &t)) return;
     if (player_queue_add(&t)) toast("Added to queue: %s", t.title);
     else toast("Already in the queue");
 }
 
 static void toggle_fav_selected(void) {
     track_t t;
-    if (!tab_get(g_tab, g_sel[g_tab], &t)) return;
+    if (!get_song(g_tab, g_sel[g_tab], &t)) return;
     int now = store_fav_toggle(&t);
     toast(now ? "Added to favorites" : "Removed from favorites");
+}
+
+static void queue_remove_selected(void) {
+    int idx = g_sel[TAB_QUEUE];
+    if (player_queue_remove(idx)) toast("Removed from the queue");
+    else if (idx < tab_count(TAB_QUEUE)) toast("Only upcoming songs can be removed");
+}
+
+static void circle_action(void) {
+    if (g_tab == TAB_PLAYLISTS) {
+        if (playlist_valid() >= 0) playlist_activate(0);
+        return;
+    }
+    if (g_tab == TAB_QUEUE) {
+        queue_remove_selected();
+        return;
+    }
+    add_selected_to_queue();
+}
+
+static void menu_close(void) {
+    g_menu.kind = MENU_NONE;
+}
+
+static void menu_add(const char *label, int act, int arg) {
+    if (g_menu.n >= MENU_MAX) return;
+    menu_item_t *it = &g_menu.it[g_menu.n++];
+    str_set(it->label, sizeof it->label, label);
+    it->act = act;
+    it->arg = arg;
+}
+
+static void menu_begin(int kind, const char *title) {
+    track_t song = g_menu.song;
+    int pl = g_menu.pl;
+    memset(&g_menu, 0, sizeof g_menu);
+    g_menu.song = song;
+    g_menu.pl = pl;
+    g_menu.kind = kind;
+    str_set(g_menu.title, sizeof g_menu.title, title);
+    g_menu.t0 = now_ms();
+}
+
+static void menu_open_song(int tab, int idx) {
+    track_t t;
+    if (!get_song(tab, idx, &t)) return;
+    g_menu.song = t;
+    menu_begin(MENU_SONG, t.title);
+    menu_add("Add to playlist", ACT_ADD_PL, 0);
+    if (store_dl_find(t.id, NULL, NULL)) menu_add("Remove download", ACT_REMOVE_DL, 0);
+    else menu_add("Download", ACT_DOWNLOAD, 0);
+    if (tab != TAB_QUEUE) menu_add("Add to queue", ACT_QUEUE, 0);
+    if (tab == TAB_QUEUE) {
+        if (idx > player_queue_cur_index()) menu_add("Remove from queue", ACT_Q_REMOVE, idx);
+        menu_add("Clear upcoming songs", ACT_Q_TRIM, 0);
+    }
+    if (tab == TAB_PLAYLISTS && playlist_valid() >= 0) menu_add("Remove from this playlist", ACT_REMOVE_FROM_PL, idx - 1);
+}
+
+static void menu_open_pick(void) {
+    menu_begin(MENU_PICK, "Add to playlist");
+    int n = store_pl_count();
+    for (int i = 0; i < n; i++) {
+        char name[64];
+        char label[80];
+        int c = store_pl_name(i, name, sizeof name);
+        snprintf(label, sizeof label, "%s  (%d)", name, c);
+        menu_add(label, ACT_PICK_PL, i);
+    }
+    menu_add("+ New playlist", ACT_NEW_PL_ADD, 0);
+}
+
+static void menu_open_playlist(int idx) {
+    char name[64];
+    if (store_pl_name(idx - 1, name, sizeof name) < 0) return;
+    g_menu.pl = idx - 1;
+    menu_begin(MENU_PL, name);
+    menu_add("Play", ACT_PL_PLAY, 0);
+    menu_add("Download all", ACT_PL_DL_ALL, 0);
+    menu_add("Rename", ACT_PL_RENAME, 0);
+    menu_add("Delete playlist", ACT_PL_DELETE, 0);
+}
+
+static void menu_open_for(int tab, int idx) {
+    if (tab == TAB_PLAYLISTS && (playlist_valid() < 0 || idx == 0)) {
+        if (g_pl_open < 0 && idx >= 1) menu_open_playlist(idx);
+        return;
+    }
+    menu_open_song(tab, idx);
+}
+
+static void menu_run(void) {
+    if (g_menu.sel < 0 || g_menu.sel >= g_menu.n) return;
+    menu_item_t it = g_menu.it[g_menu.sel];
+    track_t song = g_menu.song;
+    int pl = g_menu.pl;
+    switch (it.act) {
+    case ACT_ADD_PL:
+        menu_open_pick();
+        break;
+    case ACT_PICK_PL: {
+        char name[64];
+        store_pl_name(it.arg, name, sizeof name);
+        int r = store_pl_add(it.arg, &song);
+        menu_close();
+        if (r > 0) toast("Added to %s", name);
+        else if (r == 0) toast("Already in %s", name);
+        else toast("Could not add to %s", name);
+        break;
+    }
+    case ACT_NEW_PL_ADD:
+        menu_close();
+        prompt_new_playlist(&song);
+        break;
+    case ACT_DOWNLOAD:
+        menu_close();
+        if (!net_wifi_connected()) toast("Wi-Fi is not connected");
+        else if (dl_enqueue(&song)) toast("Downloading: %s", song.title);
+        else toast("Already downloaded or queued");
+        break;
+    case ACT_REMOVE_DL:
+        menu_close();
+        store_dl_remove(song.id);
+        toast("Download removed");
+        break;
+    case ACT_QUEUE:
+        menu_close();
+        if (player_queue_add(&song)) toast("Added to queue: %s", song.title);
+        else toast("Already in the queue");
+        break;
+    case ACT_Q_REMOVE:
+        menu_close();
+        if (player_queue_remove(it.arg)) toast("Removed from the queue");
+        break;
+    case ACT_Q_TRIM: {
+        menu_close();
+        int n = player_queue_trim();
+        if (n > 0) toast("Cleared %d upcoming songs", n);
+        else toast("Nothing upcoming to clear");
+        break;
+    }
+    case ACT_REMOVE_FROM_PL:
+        menu_close();
+        if (store_pl_remove_track(g_pl_open, it.arg)) toast("Removed from playlist");
+        break;
+    case ACT_PL_PLAY: {
+        menu_close();
+        int m = 0;
+        track_t *arr = pl_gather(pl, &m);
+        if (!arr) {
+            toast("This playlist is empty");
+            break;
+        }
+        player_set_radio(0);
+        player_queue_set(arr, m, 0);
+        free(arr);
+        break;
+    }
+    case ACT_PL_DL_ALL: {
+        menu_close();
+        if (!net_wifi_connected()) {
+            toast("Wi-Fi is not connected");
+            break;
+        }
+        int n = store_pl_track_count(pl);
+        int queued = 0;
+        for (int i = 0; i < n; i++) {
+            track_t t;
+            if (store_pl_track_get(pl, i, &t) && dl_enqueue(&t)) queued++;
+        }
+        if (queued > 0) toast("Downloading %d songs", queued);
+        else toast("Everything is already downloaded");
+        break;
+    }
+    case ACT_PL_RENAME: {
+        char cur[64];
+        char out[64];
+        store_pl_name(pl, cur, sizeof cur);
+        menu_close();
+        if (ime_run("Rename playlist", cur, out, sizeof out)) {
+            if (store_pl_rename(pl, out)) toast("Playlist renamed");
+        }
+        break;
+    }
+    case ACT_PL_DELETE: {
+        char name[64];
+        store_pl_name(pl, name, sizeof name);
+        char title[96];
+        snprintf(title, sizeof title, "Delete %s?", name);
+        menu_begin(MENU_CONFIRM, title);
+        menu_add("Delete", ACT_PL_DELETE_YES, 0);
+        menu_add("Keep it", ACT_CLOSE, 0);
+        g_menu.sel = 1;
+        break;
+    }
+    case ACT_PL_DELETE_YES:
+        menu_close();
+        if (store_pl_delete(pl)) toast("Playlist deleted");
+        break;
+    default:
+        menu_close();
+        break;
+    }
+}
+
+static void menu_scroll_to_sel(void) {
+    if (g_menu.sel < g_menu.top) g_menu.top = g_menu.sel;
+    if (g_menu.sel >= g_menu.top + MENU_VIS) g_menu.top = g_menu.sel - MENU_VIS + 1;
+    if (g_menu.top < 0) g_menu.top = 0;
 }
 
 static int pressed(unsigned btn) {
@@ -934,6 +1434,46 @@ static int near_pt(int x, int y, float cx, float cy, float r) {
     float dx = (float)x - cx;
     float dy = (float)y - cy;
     return dx * dx + dy * dy <= r * r;
+}
+
+static void handle_menu_buttons(void) {
+    if (pressed(SCE_CTRL_CIRCLE) || pressed(SCE_CTRL_TRIANGLE)) {
+        if (pressed(SCE_CTRL_TRIANGLE)) g_tri_fired = 1;
+        menu_close();
+        return;
+    }
+    if (pressed(SCE_CTRL_CROSS)) {
+        menu_run();
+        return;
+    }
+    int up = (g_pad.buttons & SCE_CTRL_UP) || g_pad.ly < 60;
+    int down = (g_pad.buttons & SCE_CTRL_DOWN) || g_pad.ly > 196;
+    if (repeat_fire(0, up) && g_menu.sel > 0) {
+        g_menu.sel--;
+        menu_scroll_to_sel();
+    }
+    if (repeat_fire(1, down) && g_menu.sel < g_menu.n - 1) {
+        g_menu.sel++;
+        menu_scroll_to_sel();
+    }
+}
+
+static void menu_tap(int x, int y) {
+    float px, py, ph;
+    int vis;
+    menu_geom(&px, &py, &ph, &vis);
+    if ((float)x < px || (float)x > px + MENU_W || (float)y < py || (float)y > py + ph) {
+        menu_close();
+        return;
+    }
+    float iy = py + MENU_TITLE_H;
+    if ((float)y < iy) return;
+    int k = (int)(((float)y - iy) / MENU_ITEM_H);
+    int idx = g_menu.top + k;
+    if (k < vis && idx < g_menu.n) {
+        g_menu.sel = idx;
+        menu_run();
+    }
 }
 
 static void handle_tap(int x, int y) {
@@ -1005,7 +1545,9 @@ static void handle_touch(void) {
             t_ly = y;
             t_accum = 0;
             t_scrub = 0;
-            if (y >= PB_Y - 24 && y <= PB_Y + 24 && x >= PB_X - 16 && x <= PB_X + PB_W + 16 && can_seek()) {
+            t_long = 0;
+            t_since = now_ms();
+            if (!g_menu.kind && y >= PB_Y - 24 && y <= PB_Y + 24 && x >= PB_X - 16 && x <= PB_X + PB_W + 16 && can_seek()) {
                 t_scrub = 1;
                 g_scrub_frac = scrub_frac_at(x);
             }
@@ -1014,7 +1556,32 @@ static void handle_touch(void) {
             int dx = x - t_x0;
             int dy = y - t_y0;
             if (!t_moved && (dx * dx + dy * dy) > 14 * 14) t_moved = 1;
-            if (t_moved && t_y0 >= LIST_Y && t_y0 < LIST_Y + LIST_H) {
+            if (g_menu.kind) {
+                if (t_moved) {
+                    t_accum += y - t_ly;
+                    while (t_accum >= MENU_ITEM_H) {
+                        g_menu.top--;
+                        t_accum -= MENU_ITEM_H;
+                    }
+                    while (t_accum <= -MENU_ITEM_H) {
+                        g_menu.top++;
+                        t_accum += MENU_ITEM_H;
+                    }
+                    int maxtop = g_menu.n - MENU_VIS;
+                    if (maxtop < 0) maxtop = 0;
+                    if (g_menu.top > maxtop) g_menu.top = maxtop;
+                    if (g_menu.top < 0) g_menu.top = 0;
+                }
+            } else if (!t_moved && !t_scrub && !t_long && t_y0 >= LIST_Y && t_y0 < LIST_Y + LIST_H &&
+                       now_ms() - t_since > 520) {
+                int row = g_top[g_tab] + (t_y0 - LIST_Y) / ROW_PITCH;
+                if (row < tab_count(g_tab)) {
+                    t_long = 1;
+                    g_sel[g_tab] = row;
+                    menu_open_for(g_tab, row);
+                }
+            }
+            if (!g_menu.kind && t_moved && t_y0 >= LIST_Y && t_y0 < LIST_Y + LIST_H) {
                 t_accum += y - t_ly;
                 int n = tab_count(g_tab);
                 while (t_accum >= ROW_PITCH) {
@@ -1032,6 +1599,16 @@ static void handle_touch(void) {
         }
     } else if (t_down) {
         t_down = 0;
+        if (t_long) {
+            t_long = 0;
+            t_scrub = 0;
+            return;
+        }
+        if (g_menu.kind) {
+            if (!t_moved) menu_tap(t_x0, t_y0);
+            t_scrub = 0;
+            return;
+        }
         if (t_scrub) {
             t_scrub = 0;
             int dur = player_duration_ms();
@@ -1071,9 +1648,21 @@ static void update_art(void) {
 static void handle_buttons(void) {
     if (pressed(SCE_CTRL_SELECT)) start_search();
     if (pressed(SCE_CTRL_CROSS)) play_at(g_tab, g_sel[g_tab]);
-    if (pressed(SCE_CTRL_CIRCLE)) add_selected_to_queue();
+    if (pressed(SCE_CTRL_CIRCLE)) circle_action();
     if (pressed(SCE_CTRL_SQUARE)) player_toggle_pause();
-    if (pressed(SCE_CTRL_TRIANGLE)) toggle_fav_selected();
+    if (pressed(SCE_CTRL_TRIANGLE)) {
+        g_tri_since = now_ms();
+        g_tri_fired = 0;
+    }
+    if ((g_pad.buttons & SCE_CTRL_TRIANGLE) && g_tri_since && !g_tri_fired && now_ms() - g_tri_since > 450) {
+        g_tri_fired = 1;
+        menu_open_for(g_tab, g_sel[g_tab]);
+        return;
+    }
+    if (!(g_pad.buttons & SCE_CTRL_TRIANGLE) && (g_prev.buttons & SCE_CTRL_TRIANGLE)) {
+        if (!g_tri_fired) toggle_fav_selected();
+        g_tri_since = 0;
+    }
     if (pressed(SCE_CTRL_LTRIGGER)) player_prev();
     if (pressed(SCE_CTRL_RTRIGGER)) player_next();
     if (pressed(SCE_CTRL_LEFT)) switch_tab(-1);
@@ -1147,6 +1736,8 @@ int ui_init(void) {
     g_heart = vita2d_load_PNG_file("app0:assets/Heart.png");
     g_heart_s = vita2d_load_PNG_file("app0:assets/Heart_s.png");
     g_note = vita2d_load_PNG_file("app0:assets/Note.png");
+    g_search = vita2d_load_PNG_file("app0:assets/Search.png");
+    if (g_search) vita2d_texture_set_filters(g_search, SCE_GXM_TEXTURE_FILTER_LINEAR, SCE_GXM_TEXTURE_FILTER_LINEAR);
     if (g_heart) vita2d_texture_set_filters(g_heart, SCE_GXM_TEXTURE_FILTER_LINEAR, SCE_GXM_TEXTURE_FILTER_LINEAR);
     if (g_heart_s) vita2d_texture_set_filters(g_heart_s, SCE_GXM_TEXTURE_FILTER_LINEAR, SCE_GXM_TEXTURE_FILTER_LINEAR);
     if (g_note) vita2d_texture_set_filters(g_note, SCE_GXM_TEXTURE_FILTER_LINEAR, SCE_GXM_TEXTURE_FILTER_LINEAR);
@@ -1185,9 +1776,14 @@ int ui_frame(void) {
         return 0;
     }
 
-    handle_buttons();
+    char dl_ev[160];
+    if (dl_take_event(dl_ev, sizeof dl_ev)) toast("%s", dl_ev);
+
+    if (g_menu.kind) handle_menu_buttons();
+    else handle_buttons();
     handle_touch();
     update_art();
+    thumbs_pump();
     animate();
     render_frame(0);
     return 0;
@@ -1201,6 +1797,7 @@ void ui_shutdown(void) {
     if (g_heart) vita2d_free_texture(g_heart);
     if (g_heart_s) vita2d_free_texture(g_heart_s);
     if (g_note) vita2d_free_texture(g_note);
+    if (g_search) vita2d_free_texture(g_search);
     gfx_font_free(g_ps);
     if (g_font) vita2d_free_pgf(g_font);
     vita2d_fini();

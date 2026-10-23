@@ -1,5 +1,6 @@
 #include "jobs.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -217,17 +218,38 @@ static int art_worker(SceSize args, void *argp) {
         }
         buf_t b;
         buf_init(&b);
-        const char *hdr[] = {"User-Agent: Mozilla/5.0", NULL};
-        http_req_t r;
-        memset(&r, 0, sizeof r);
-        r.url = url;
-        r.headers = hdr;
-        r.range_start = -1;
-        r.range_end = -1;
-        r.timeout_s = 20;
-        r.cancel = &g_never_cancel;
         long status = 0;
-        int rc = http_fetch(h, &r, &b, ART_MAX_BYTES, &status);
+        int rc = HTTP_FAILED;
+        if (starts_with(url, "ux0:")) {
+            FILE *lf = fopen(url, "rb");
+            if (lf) {
+                uint8_t tmp[4096];
+                size_t n;
+                int okread = 1;
+                while ((n = fread(tmp, 1, sizeof tmp, lf)) > 0) {
+                    if (b.len + n > ART_MAX_BYTES || buf_append(&b, tmp, n) < 0) {
+                        okread = 0;
+                        break;
+                    }
+                }
+                fclose(lf);
+                if (okread) {
+                    rc = HTTP_OK;
+                    status = 200;
+                }
+            }
+        } else {
+            const char *hdr[] = {"User-Agent: Mozilla/5.0", NULL};
+            http_req_t r;
+            memset(&r, 0, sizeof r);
+            r.url = url;
+            r.headers = hdr;
+            r.range_start = -1;
+            r.range_end = -1;
+            r.timeout_s = 20;
+            r.cancel = &g_never_cancel;
+            rc = http_fetch(h, &r, &b, ART_MAX_BYTES, &status);
+        }
         if (rc == HTTP_OK && status == 200 && b.len > 100) {
             mx_lock(&g_mx);
             if (!A.pending) {

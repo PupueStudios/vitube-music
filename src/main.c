@@ -6,7 +6,9 @@
 #include <psp2/kernel/processmgr.h>
 #include <psp2/power.h>
 
+#include "dl.h"
 #include "jobs.h"
+#include "thumbs.h"
 #include "net.h"
 #include "player.h"
 #include "store.h"
@@ -65,12 +67,16 @@ int main(void) {
     store_init();
     if (player_init() < 0) log_msg("player init failed");
     jobs_init();
+    dl_init();
+    thumbs_init();
 
     while (!ui_frame()) {
     }
 
     player_shutdown();
     jobs_shutdown();
+    dl_shutdown();
+    thumbs_shutdown();
     ui_shutdown();
     sceKernelExitProcess(0);
     return 0;

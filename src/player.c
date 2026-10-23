@@ -11,6 +11,7 @@
 
 #include "aac.h"
 #include "hls.h"
+#include "hlsres.h"
 #include "jobs.h"
 #include "net.h"
 #include "store.h"
@@ -36,7 +37,8 @@ typedef struct {
 
 typedef enum {
     RES_NONE = 0,
-    RES_HLS
+    RES_HLS,
+    RES_FILE
 } res_kind_t;
 
 typedef struct {
@@ -44,6 +46,7 @@ typedef struct {
     char id[16];
     hls_media_t hls;
     int duration_ms;
+    int frames;
 } resolved_t;
 
 enum {
@@ -539,84 +542,125 @@ done:
     return result;
 }
 
+static int adts_skip(FILE *fp, int frames) {
+    uint8_t hd[7];
+    int i = 0;
+    int bad = 0;
+    while (i < frames) {
+        if (fread(hd, 1, 7, fp) != 7) return -1;
+        long flen = ((hd[3] & 3) << 11) | (hd[4] << 3) | (hd[5] >> 5);
+        if (hd[0] != 0xFF || (hd[1] & 0xF6) != 0xF0 || flen < 7) {
+            if (++bad > 4096) return -1;
+            if (fseek(fp, -6, SEEK_CUR) != 0) return -1;
+            continue;
+        }
+        if (fseek(fp, flen - 7, SEEK_CUR) != 0) return -1;
+        i++;
+    }
+    return 0;
+}
+
+static int feed_file(resolved_t *r, int start_ms, sess_t *s, uint32_t gen) {
+    char path[96];
+    store_dl_path(r->id, "aac", path, sizeof path);
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return FEED_FAIL_EARLY;
+    setvbuf(fp, NULL, _IOFBF, 32 * 1024);
+    int skip_ms = 0;
+    if (start_ms > 0 && r->duration_ms > 0 && r->frames > 0) {
+        long long fr = (long long)start_ms * r->frames / r->duration_ms;
+        int skip_frames = fr > 2 ? (int)(fr - 2) : 0;
+        if (skip_frames > 0) {
+            if (adts_skip(fp, skip_frames) != 0) {
+                fclose(fp);
+                return FEED_FAIL_EARLY;
+            }
+            long long got = (long long)skip_frames * r->duration_ms / r->frames;
+            skip_ms = start_ms - (int)got;
+        } else {
+            skip_ms = start_ms;
+        }
+    }
+    feed_t *f = feed_new(s, gen, skip_ms);
+    if (!f) {
+        fclose(fp);
+        return FEED_FAIL_EARLY;
+    }
+    aac_t *a = aac_new(pcm_cb, f);
+    uint8_t *buf = malloc(16384);
+    if (!a || !buf) {
+        aac_free(a);
+        free(buf);
+        feed_free(f);
+        fclose(fp);
+        return FEED_FAIL_EARLY;
+    }
+    int result = FEED_OK;
+    for (;;) {
+        if (s->cancel) {
+            result = FEED_CANCEL;
+            break;
+        }
+        size_t n = fread(buf, 1, 16384, fp);
+        if (n == 0) break;
+        if (aac_push_adts(a, buf, n) < 0 && !f->failed) f->failed = 2;
+        if (f->failed == 1) {
+            result = FEED_CANCEL;
+            break;
+        }
+        if (f->failed) {
+            result = f->produced > 0 ? FEED_FAIL : FEED_FAIL_EARLY;
+            break;
+        }
+    }
+    if (result == FEED_OK && f->produced == 0) result = FEED_FAIL_EARLY;
+    aac_free(a);
+    free(buf);
+    feed_free(f);
+    fclose(fp);
+    return result;
+}
+
 static void res_free(resolved_t *r) {
     hls_media_free(&r->hls);
     memset(r, 0, sizeof *r);
 }
 
-static int fetch_text(http_t *h, const char *url, const char *const *hdr, buf_t *out, volatile int *cancel,
-                      long *status) {
-    http_req_t rq;
-    memset(&rq, 0, sizeof rq);
-    rq.url = url;
-    rq.headers = hdr;
-    rq.range_start = -1;
-    rq.range_end = -1;
-    rq.timeout_s = 30;
-    rq.compress = 1;
-    rq.cancel = cancel;
-    return http_fetch(h, &rq, out, 16u * 1024u * 1024u, status);
+static int resolve_hls(http_t *h, const track_t *t, resolved_t *r, sess_t *s, char *err, size_t ec) {
+    hls_media_t m;
+    int rc = hlsres_resolve(h, t->id, &m, &s->cancel, err, ec);
+    if (rc < 0) return rc;
+    r->hls = m;
+    r->kind = RES_HLS;
+    r->duration_ms = (int)(m.total * 1000.0);
+    str_set(r->id, sizeof r->id, t->id);
+    return 0;
 }
 
-static int resolve_hls(http_t *h, const track_t *t, resolved_t *r, sess_t *s, char *err, size_t ec) {
-    char *master = malloc(3072);
-    if (!master) return -1;
-    int rc = ytm_hls_master(h, t->id, master, 3072, &s->cancel, err, ec);
-    if (rc < 0) {
-        free(master);
-        return rc;
+static int resolve_local(const track_t *t, resolved_t *r) {
+    int frames = 0;
+    int dur = 0;
+    if (!store_dl_find(t->id, &frames, &dur)) return -1;
+    char path[96];
+    store_dl_path(t->id, "aac", path, sizeof path);
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        log_msg("download missing for %s, dropping it from the index", t->id);
+        store_dl_remove(t->id);
+        return -1;
     }
-    buf_t b;
-    buf_init(&b);
-    long status = 0;
-    rc = fetch_text(h, master, HDR_VISION, &b, &s->cancel, &status);
-    if (rc != HTTP_OK || status != 200 || !b.data) {
-        log_msg("hls master fetch rc=%d status=%ld", rc, status);
-        snprintf(err, ec, "HLS manifest fetch failed (%ld)", status);
-        buf_free(&b);
-        free(master);
-        return -2;
-    }
-    hls_cand_t cands[12];
-    int nc = hls_pick_variants(b.data, master, cands, 12);
-    buf_free(&b);
-    log_msg("hls: %d candidate playlists", nc);
-    int ok = 0;
-    for (int i = 0; i < nc && !ok && !s->cancel; i++) {
-        buf_t pb;
-        buf_init(&pb);
-        rc = fetch_text(h, cands[i].uri, HDR_VISION, &pb, &s->cancel, &status);
-        if (rc != HTTP_OK || status != 200 || !pb.data) {
-            log_msg("hls playlist %d fetch rc=%d status=%ld", i, rc, status);
-            buf_free(&pb);
-            continue;
-        }
-        hls_media_t m;
-        int n = hls_parse_media(pb.data, cands[i].uri, &m);
-        if (n <= 0 || m.has_map) {
-            log_msg("hls playlist %d unusable (n=%d map=%d)", i, n, m.has_map);
-            hls_media_free(&m);
-            continue;
-        }
-        r->hls = m;
-        r->kind = RES_HLS;
-        r->duration_ms = (int)(m.total * 1000.0);
-        str_set(r->id, sizeof r->id, t->id);
-        log_msg("hls: using playlist %d, %d segments, %.1fs", i, n, m.total);
-        ok = 1;
-    }
-    hls_cands_free(cands, nc);
-    free(master);
-    if (!ok) {
-        snprintf(err, ec, "No usable HLS audio");
-        return -3;
-    }
+    fclose(fp);
+    r->kind = RES_FILE;
+    r->frames = frames;
+    r->duration_ms = dur;
+    str_set(r->id, sizeof r->id, t->id);
     return 0;
 }
 
 static int resolve_track(http_t *h, const track_t *t, resolved_t *r, sess_t *s, char *err, size_t ec) {
     memset(r, 0, sizeof *r);
     err[0] = '\0';
+    if (resolve_local(t, r) == 0) return 0;
     int rc = resolve_hls(h, t, r, s, err, ec);
     if (rc == 0) return 0;
     res_free(r);
@@ -631,7 +675,14 @@ static void request_play_locked(int idx, int start_ms) {
     if (P.sess) P.sess->cancel = 1;
 }
 
+static volatile int g_radio = 1;
+
+void player_set_radio(int on) {
+    g_radio = on;
+}
+
 static void maybe_radio(int idx) {
+    if (!g_radio) return;
     char last[16] = "";
     mx_lock(&P.mx);
     if (P.qn > 0 && P.qn - idx <= 3) str_set(last, sizeof last, P.q[P.qn - 1].id);
@@ -721,11 +772,20 @@ static void run_track(http_t *h, const track_t *t, int idx, int start_ms, sess_t
     if (start_ms == 0) store_hist_push(t);
     maybe_radio(idx);
     char art[300];
-    if (t->thumb[0]) snprintf(art, sizeof art, "%s", t->thumb);
-    else snprintf(art, sizeof art, "https://i.ytimg.com/vi/%s/hqdefault.jpg", t->id);
+    art[0] = '\0';
+    if (cur->kind == RES_FILE) {
+        store_dl_path(t->id, "jpg", art, sizeof art);
+        FILE *af = fopen(art, "rb");
+        if (af) fclose(af);
+        else art[0] = '\0';
+    }
+    if (!art[0]) {
+        if (t->thumb[0]) snprintf(art, sizeof art, "%s", t->thumb);
+        else snprintf(art, sizeof art, "https://i.ytimg.com/vi/%s/hqdefault.jpg", t->id);
+    }
     jobs_art(art, t->id);
 
-    int rc = feed_hls(h, cur, start_ms, s, gen);
+    int rc = cur->kind == RES_FILE ? feed_file(cur, start_ms, s, gen) : feed_hls(h, cur, start_ms, s, gen);
 
     if (s->cancel || rc == FEED_CANCEL) return;
     if (rc == FEED_FAIL_EARLY) {
@@ -876,6 +936,41 @@ void player_queue_append(const track_t *t, int n) {
     }
     mx_unlock(&P.mx);
     log_msg("queue: appended %d tracks", added);
+}
+
+static int queue_base_locked(void) {
+    return P.req_pending ? P.req_idx : P.cur;
+}
+
+int player_queue_cur_index(void) {
+    mx_lock(&P.mx);
+    int base = queue_base_locked();
+    mx_unlock(&P.mx);
+    return base;
+}
+
+int player_queue_remove(int idx) {
+    int ok = 0;
+    mx_lock(&P.mx);
+    if (idx > queue_base_locked() && idx < P.qn) {
+        memmove(&P.q[idx], &P.q[idx + 1], sizeof(track_t) * (size_t)(P.qn - idx - 1));
+        P.qn--;
+        ok = 1;
+    }
+    mx_unlock(&P.mx);
+    return ok;
+}
+
+int player_queue_trim(void) {
+    int removed = 0;
+    mx_lock(&P.mx);
+    int base = queue_base_locked();
+    if (base >= 0 && base + 1 < P.qn) {
+        removed = P.qn - (base + 1);
+        P.qn = base + 1;
+    }
+    mx_unlock(&P.mx);
+    return removed;
 }
 
 int player_queue_count(void) {
