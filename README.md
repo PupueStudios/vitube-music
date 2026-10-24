@@ -2,7 +2,7 @@
 
 A YouTube Music client for the PS Vita. Search for a song, hit play, and autoplay radio keeps the music going. It runs entirely on the console, no companion server or PC needed.
 
-<img width="960" height="544" alt="2026-10-23-220415" src="https://github.com/user-attachments/assets/d9c268e6-2467-48fd-bd6d-f9367bf3024a" />
+<img width="960" height="544" alt="2026-10-24-152555" src="https://github.com/user-attachments/assets/d1bf986e-641c-42b5-932a-e05114950ca5" />
 
 > [!CAUTION]
 > This project was made with AI assistance.
