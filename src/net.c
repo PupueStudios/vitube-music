@@ -6,6 +6,7 @@
 
 #include <curl/curl.h>
 #include <psp2/net/net.h>
+#include <psp2/kernel/threadmgr.h>
 #include <psp2/net/netctl.h>
 #include <psp2/sysmodule.h>
 
@@ -27,6 +28,35 @@ static char g_cainfo[160];
 static int g_insecure;
 static int g_net_ready;
 
+#define SSL_LOCKS 64
+#define SSL_LOCK_FLAG 1
+
+extern void CRYPTO_set_locking_callback(void (*func)(int mode, int type, const char *file, int line));
+extern void CRYPTO_set_id_callback(unsigned long (*func)(void));
+
+static mutex_t g_ssl_locks[SSL_LOCKS];
+
+static void ssl_locking_cb(int mode, int type, const char *file, int line) {
+    (void)file;
+    (void)line;
+    if (type < 0 || type >= SSL_LOCKS) return;
+    if (mode & SSL_LOCK_FLAG) mx_lock(&g_ssl_locks[type]);
+    else mx_unlock(&g_ssl_locks[type]);
+}
+
+static unsigned long ssl_thread_id_cb(void) {
+    return (unsigned long)sceKernelGetThreadId();
+}
+
+static void ssl_threading_init(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    for (int i = 0; i < SSL_LOCKS; i++) mx_init(&g_ssl_locks[i], "ytm_ssl");
+    CRYPTO_set_id_callback(ssl_thread_id_cb);
+    CRYPTO_set_locking_callback(ssl_locking_cb);
+}
+
 int net_init(int insecure) {
     g_insecure = insecure;
     sceSysmoduleLoadModule(SCE_SYSMODULE_NET);
@@ -40,6 +70,7 @@ int net_init(int insecure) {
     if (r < 0) log_msg("sceNetInit failed %08x", (unsigned)r);
     r = sceNetCtlInit();
     if (r < 0) log_msg("sceNetCtlInit failed %08x", (unsigned)r);
+    ssl_threading_init();
     CURLcode cc = curl_global_init(CURL_GLOBAL_DEFAULT);
     if (cc != CURLE_OK) {
         log_msg("curl_global_init failed %d", (int)cc);

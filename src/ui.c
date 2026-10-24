@@ -30,8 +30,8 @@
 #define CHIP_Y 14
 #define CHIP_H 36
 #define CHIP_X0 84
-#define CHIP_PAD 14
-#define CHIP_GAP 8
+#define CHIP_PAD 12
+#define CHIP_GAP 6
 
 #define LIST_Y 72
 #define ROW_PITCH 60
@@ -43,7 +43,8 @@
 #define THUMB 40
 
 #define FOOT_X 16
-#define FOOT_Y 388
+#define FOOT_Y (388.0f + 36.0f * g_foot_shift)
+#define LIST_DRAW_H (LIST_H + 36.0f * g_foot_shift)
 #define FOOT_W 928
 #define FOOT_H 104
 #define FOOT_R 22
@@ -80,7 +81,16 @@ enum {
     TAB_PLAYLISTS,
     TAB_OFFLINE,
     TAB_HIST,
+    TAB_OPTIONS,
     TAB_COUNT
+};
+
+enum {
+    ROW_HINTS = 0,
+    ROW_RADIO,
+    ROW_CLEAR_HIST,
+    ROW_CLEAR_DL,
+    ROW_COUNT
 };
 
 #define MENU_MAX 72
@@ -112,6 +122,8 @@ enum {
     ACT_PL_DELETE_YES,
     ACT_Q_REMOVE,
     ACT_Q_TRIM,
+    ACT_HIST_CLEAR_YES,
+    ACT_DL_CLEAR_YES,
     ACT_CLOSE
 };
 
@@ -130,7 +142,7 @@ typedef struct {
     const char *label;
 } hint_t;
 
-static const char *const TAB_NAMES[TAB_COUNT] = {"Search", "Queue", "Favorites", "Playlists", "Offline", "History"};
+static const char *const TAB_NAMES[TAB_COUNT] = {"Search", "Queue", "Favorites", "Playlists", "Offline", "History", "Options"};
 
 static vita2d_pgf *g_font;
 static GfxFont *g_ps;
@@ -146,6 +158,8 @@ static float g_dt = 1.0f / 60.0f;
 static float g_t;
 static float g_intro;
 static float g_tabfade = 1.0f;
+static float g_foot_shift;
+static int g_foot_init;
 static float g_tabdir;
 static float g_prog;
 static float g_hl[TAB_COUNT];
@@ -236,9 +250,52 @@ static int tab_count(int tab) {
         return playlist_valid() < 0 ? 1 + store_pl_count() : 1 + store_pl_track_count(g_pl_open);
     case TAB_OFFLINE:
         return store_dl_count();
+    case TAB_OPTIONS:
+        return ROW_COUNT;
     default:
         return store_hist_count();
     }
+}
+
+static int option_info(int row, char *title, size_t tc, char *sub, size_t sc, int *toggle, int *on) {
+    *toggle = 0;
+    *on = 0;
+    switch (row) {
+    case ROW_HINTS:
+        str_set(title, tc, "Button hints");
+        str_set(sub, sc, "Show the controls bar at the bottom");
+        *toggle = 1;
+        *on = store_opt(OPT_HINTS);
+        return 1;
+    case ROW_RADIO:
+        str_set(title, tc, "Autoplay similar songs");
+        str_set(sub, sc, "Keep playing related songs when the queue runs out");
+        *toggle = 1;
+        *on = store_opt(OPT_RADIO);
+        return 1;
+    case ROW_CLEAR_HIST:
+        str_set(title, tc, "Clear history");
+        snprintf(sub, sc, "%d songs in your history", store_hist_count());
+        return 1;
+    case ROW_CLEAR_DL:
+        str_set(title, tc, "Delete all downloads");
+        snprintf(sub, sc, "%d downloaded songs", store_dl_count());
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int option_row(int i, track_t *t) {
+    char title[64];
+    char sub[96];
+    int toggle, on;
+    if (!option_info(i, title, sizeof title, sub, sizeof sub, &toggle, &on)) return 0;
+    memset(t, 0, sizeof *t);
+    str_set(t->id, sizeof t->id, "ui:ctl");
+    str_set(t->title, sizeof t->title, title);
+    str_set(t->artist, sizeof t->artist, sub);
+    return 1;
 }
 
 static int playlist_row(int i, track_t *t) {
@@ -279,12 +336,15 @@ static int tab_get(int tab, int i, track_t *t) {
         return playlist_row(i, t);
     case TAB_OFFLINE:
         return store_dl_get(i, t);
+    case TAB_OPTIONS:
+        return option_row(i, t);
     default:
         return store_hist_get(i, t);
     }
 }
 
 static int get_song(int tab, int idx, track_t *t) {
+    if (tab == TAB_OPTIONS) return 0;
     if (tab == TAB_PLAYLISTS) {
         if (playlist_valid() < 0 || idx < 1) return 0;
         return store_pl_track_get(g_pl_open, idx - 1, t);
@@ -502,13 +562,6 @@ static void draw_header(void) {
         }
     }
 
-    if (jobs_search_busy()) {
-        for (int i = 0; i < 3; i++) {
-            float k = 0.5f + 0.5f * sinf(g_t * 7.0f - (float)i * 0.9f);
-            vita2d_draw_fill_circle(716.0f + (float)i * 12.0f, 32.0f, 3.0f + 1.5f * k, C(RED, 0.4f + 0.6f * k));
-        }
-    }
-
     int pct = scePowerGetBatteryLifePercent();
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
@@ -520,13 +573,24 @@ static void draw_header(void) {
     float ix = bx - tw(FS_XS, b) - 38.0f;
     dl_status_t ds;
     dl_status(&ds);
+    float dl_left = ix;
     if (ds.active || ds.pending > 0) {
         char dtxt[48];
         if (ds.pending > 0) snprintf(dtxt, sizeof dtxt, "%d%%  +%d", ds.pct, ds.pending);
         else snprintf(dtxt, sizeof dtxt, "%d%%", ds.pct);
         float drx = ix - 18.0f;
         tx_right(drx, 32.0f, FS_XS, C(255, 255, 255, 0.70), dtxt);
-        icon_download(drx - tw(FS_XS, dtxt) - 14.0f, 32.0f, 14.0f, C(120, 220, 150, 0.95));
+        dl_left = drx - tw(FS_XS, dtxt) - 14.0f;
+        icon_download(dl_left, 32.0f, 14.0f, C(120, 220, 150, 0.95));
+    }
+    float last_x, last_w;
+    chip_rect(TAB_COUNT - 1, &last_x, &last_w);
+    float dots_x = last_x + last_w + 24.0f;
+    if (jobs_search_busy() && dots_x + 36.0f < dl_left - 16.0f) {
+        for (int i = 0; i < 3; i++) {
+            float k = 0.5f + 0.5f * sinf(g_t * 7.0f - (float)i * 0.9f);
+            vita2d_draw_fill_circle(dots_x + (float)i * 12.0f, 32.0f, 3.0f + 1.5f * k, C(RED, 0.4f + 0.6f * k));
+        }
     }
     gfx_rounded_ring(ix, 25.5f, 26.0f, 13.0f, 4.0f, 1.5f, C(255, 255, 255, 0.55));
     vita2d_draw_rectangle(ix + 26.0f, 29.0f, 2.0f, 6.0f, C(255, 255, 255, 0.55));
@@ -609,6 +673,39 @@ static void draw_thumb_tex(vita2d_texture *tex, float x, float y, float size, fl
                                         gfx_color(255, 255, 255, alpha));
 }
 
+static void draw_switch(float x, float cy, int on) {
+    const float w = 46.0f;
+    const float h = 24.0f;
+    float y = cy - h * 0.5f;
+    if (on) gfx_rounded_rect(x, y, w, h, h * 0.5f, C(RED, 0.95));
+    else gfx_rounded_rect(x, y, w, h, h * 0.5f, C(255, 255, 255, 0.18));
+    float kx = on ? x + w - h * 0.5f : x + h * 0.5f;
+    vita2d_draw_fill_circle(kx, cy, h * 0.5f - 3.0f, C(255, 255, 255, on ? 1.0 : 0.75));
+}
+
+static void draw_option_row(int idx, float y, int sel) {
+    char title[64];
+    char sub[96];
+    int toggle, on;
+    if (!option_info(idx, title, sizeof title, sub, sizeof sub, &toggle, &on)) return;
+    float x = ROW_X + 24.0f;
+    float right = ROW_X + ROW_W - 22.0f;
+    float cy = y + ROW_H * 0.5f;
+    float lim = right;
+    if (toggle) {
+        draw_switch(right - 46.0f, cy, on);
+        lim = right - 46.0f - 16.0f;
+    } else {
+        tx_right(right, cy, FS_L, C(255, 255, 255, sel ? 0.78 : 0.45), ">");
+        lim = right - 30.0f;
+    }
+    float maxw = lim - x - 14.0f;
+    int danger = !toggle;
+    unsigned tc = danger ? C(255, 110, 120, sel ? 1.0 : 0.88) : C(255, 255, 255, sel ? 1.0 : 0.92);
+    tx_fit(x, y + 19.0f, maxw, FS_M, tc, title);
+    tx_fit(x, y + 38.0f, maxw, FS_XS, C(255, 255, 255, sel ? 0.66 : 0.50), sub);
+}
+
 static void draw_row(int idx, const track_t *t, float y, int sel) {
     int playing = is_current_track(t);
     pl_state_t st = player_state();
@@ -679,7 +776,7 @@ static void draw_list(void) {
     float scroll = g_scroll[g_tab];
 
     vita2d_enable_clipping();
-    vita2d_set_clip_rectangle(0, LIST_Y, (int)SCREEN_W - 1, LIST_Y + LIST_H - 1);
+    vita2d_set_clip_rectangle(0, LIST_Y, (int)SCREEN_W - 1, LIST_Y + (int)LIST_DRAW_H - 1);
 
     float hy = LIST_Y + (g_hl[g_tab] - scroll) * ROW_PITCH + (ROW_PITCH - ROW_H) * 0.5f;
     float pulse = 0.5f + 0.5f * sinf(g_t * 3.0f);
@@ -693,12 +790,13 @@ static void draw_list(void) {
         track_t t;
         if (!tab_get(g_tab, idx, &t)) break;
         float y = LIST_Y + ((float)idx - scroll) * ROW_PITCH + (ROW_PITCH - ROW_H) * 0.5f;
-        draw_row(idx, &t, y, idx == g_sel[g_tab]);
+        if (g_tab == TAB_OPTIONS) draw_option_row(idx, y, idx == g_sel[g_tab]);
+        else draw_row(idx, &t, y, idx == g_sel[g_tab]);
     }
     vita2d_disable_clipping();
 
     if (count > VISIBLE) {
-        float th = LIST_H - 8.0f;
+        float th = LIST_DRAW_H - 8.0f;
         float bh = th * VISIBLE / (float)count;
         if (bh < 28.0f) bh = 28.0f;
         float range = (float)(count - VISIBLE);
@@ -843,6 +941,14 @@ static int build_hints(hint_t *h) {
     int top_pl = g_tab == TAB_PLAYLISTS && playlist_valid() < 0;
     h[n++] = (hint_t){"34", "Move"};
     h[n++] = (hint_t){"21", "Tabs"};
+    if (g_tab == TAB_OPTIONS) {
+        h[n++] = (hint_t){"x", "Change"};
+        h[n++] = (hint_t){"s", "Pause"};
+        h[n++] = (hint_t){"lr", "Skip"};
+        h[n++] = (hint_t){"b", "Search"};
+        h[n++] = (hint_t){"a", "Screen off"};
+        return n;
+    }
     h[n++] = (hint_t){"x", g_tab == TAB_PLAYLISTS && top_pl ? "Open" : "Play"};
     if (g_tab == TAB_QUEUE) h[n++] = (hint_t){"c", "Remove"};
     else if (g_tab == TAB_PLAYLISTS) {
@@ -859,10 +965,11 @@ static int build_hints(hint_t *h) {
 }
 
 static void draw_hints(void) {
+    if (!store_opt(OPT_HINTS)) return;
     hint_t h[12];
     const int n = build_hints(h);
     float e = gfx_ease_out_cubic(gfx_clamp01(g_intro));
-    g_alpha = e;
+    g_alpha = e * (1.0f - g_foot_shift);
 
     const float igap = 6.0f;
     const float gap = 20.0f;
@@ -943,7 +1050,8 @@ static void draw_menu(void) {
             gfx_rounded_rect_vgrad(px + 10.0f, y, MENU_W - 20.0f, MENU_ITEM_H - 4.0f, 14.0f, C(255, 255, 255, 0.16), C(255, 255, 255, 0.06));
             gfx_rounded_rect(px + 18.0f, y + (MENU_ITEM_H - 4.0f - 20.0f) * 0.5f, 4.0f, 20.0f, 2.0f, C(RED, 1.0));
         }
-        int danger = g_menu.it[idx].act == ACT_PL_DELETE || g_menu.it[idx].act == ACT_PL_DELETE_YES;
+        int act = g_menu.it[idx].act;
+        int danger = act == ACT_PL_DELETE || act == ACT_PL_DELETE_YES || act == ACT_HIST_CLEAR_YES || act == ACT_DL_CLEAR_YES;
         unsigned col = danger ? C(255, 110, 120, on ? 1.0 : 0.85) : C(255, 255, 255, on ? 1.0 : 0.80);
         tx_fit(px + 36.0f, y + (MENU_ITEM_H - 4.0f) * 0.5f, MENU_W - 72.0f, FS_M, col, g_menu.it[idx].label);
     }
@@ -1156,9 +1264,15 @@ static void playlist_activate(int idx) {
     free(arr);
 }
 
+static void option_activate(int row);
+
 static void play_at(int tab, int idx) {
     int n = tab_count(tab);
     if (idx < 0 || idx >= n) return;
+    if (tab == TAB_OPTIONS) {
+        option_activate(idx);
+        return;
+    }
     if (tab == TAB_PLAYLISTS) {
         playlist_activate(idx);
         return;
@@ -1281,6 +1395,7 @@ static void menu_open_playlist(int idx) {
 }
 
 static void menu_open_for(int tab, int idx) {
+    if (tab == TAB_OPTIONS) return;
     if (tab == TAB_PLAYLISTS && (playlist_valid() < 0 || idx == 0)) {
         if (g_pl_open < 0 && idx >= 1) menu_open_playlist(idx);
         return;
@@ -1396,10 +1511,54 @@ static void menu_run(void) {
         menu_close();
         if (store_pl_delete(pl)) toast("Playlist deleted");
         break;
+    case ACT_HIST_CLEAR_YES:
+        menu_close();
+        store_hist_clear();
+        toast("History cleared");
+        break;
+    case ACT_DL_CLEAR_YES:
+        menu_close();
+        store_dl_clear();
+        toast("Downloads deleted");
+        break;
     default:
         menu_close();
         break;
     }
+}
+
+static void option_activate(int row) {
+    char title[64];
+    char sub[96];
+    int toggle, on;
+    if (!option_info(row, title, sizeof title, sub, sizeof sub, &toggle, &on)) return;
+    if (toggle) {
+        int id = row == ROW_HINTS ? OPT_HINTS : OPT_RADIO;
+        store_opt_set(id, !on);
+        toast("%s: %s", title, on ? "Off" : "On");
+        return;
+    }
+    char q[96];
+    if (row == ROW_CLEAR_HIST) {
+        if (store_hist_count() == 0) {
+            toast("History is already empty");
+            return;
+        }
+        snprintf(q, sizeof q, "Clear your history?");
+        menu_begin(MENU_CONFIRM, q);
+        menu_add("Clear", ACT_HIST_CLEAR_YES, 0);
+    } else {
+        int n = store_dl_count();
+        if (n == 0) {
+            toast("There are no downloads");
+            return;
+        }
+        snprintf(q, sizeof q, "Delete %d downloaded songs?", n);
+        menu_begin(MENU_CONFIRM, q);
+        menu_add("Delete", ACT_DL_CLEAR_YES, 0);
+    }
+    menu_add("Keep", ACT_CLOSE, 0);
+    g_menu.sel = 1;
 }
 
 static void menu_scroll_to_sel(void) {
@@ -1489,7 +1648,7 @@ static void handle_tap(int x, int y) {
         }
         return;
     }
-    if (y >= LIST_Y && y < LIST_Y + LIST_H) {
+    if (y >= LIST_Y && y < LIST_Y + (int)LIST_DRAW_H) {
         int row = g_top[g_tab] + (y - LIST_Y) / ROW_PITCH;
         if (row < tab_count(g_tab)) {
             g_sel[g_tab] = row;
@@ -1572,7 +1731,7 @@ static void handle_touch(void) {
                     if (g_menu.top > maxtop) g_menu.top = maxtop;
                     if (g_menu.top < 0) g_menu.top = 0;
                 }
-            } else if (!t_moved && !t_scrub && !t_long && t_y0 >= LIST_Y && t_y0 < LIST_Y + LIST_H &&
+            } else if (!t_moved && !t_scrub && !t_long && t_y0 >= LIST_Y && t_y0 < LIST_Y + (int)LIST_DRAW_H &&
                        now_ms() - t_since > 520) {
                 int row = g_top[g_tab] + (t_y0 - LIST_Y) / ROW_PITCH;
                 if (row < tab_count(g_tab)) {
@@ -1581,7 +1740,7 @@ static void handle_touch(void) {
                     menu_open_for(g_tab, row);
                 }
             }
-            if (!g_menu.kind && t_moved && t_y0 >= LIST_Y && t_y0 < LIST_Y + LIST_H) {
+            if (!g_menu.kind && t_moved && t_y0 >= LIST_Y && t_y0 < LIST_Y + (int)LIST_DRAW_H) {
                 t_accum += y - t_ly;
                 int n = tab_count(g_tab);
                 while (t_accum >= ROW_PITCH) {
@@ -1694,6 +1853,15 @@ static void animate(void) {
     g_t += g_dt;
     if (g_intro < 1.0f) g_intro = fminf(1.0f, g_intro + g_dt / 0.8f);
     if (g_tabfade < 1.0f) g_tabfade = fminf(1.0f, g_tabfade + g_dt / 0.28f);
+
+    float foot_target = store_opt(OPT_HINTS) ? 0.0f : 1.0f;
+    if (!g_foot_init) {
+        g_foot_init = 1;
+        g_foot_shift = foot_target;
+    } else {
+        g_foot_shift += (foot_target - g_foot_shift) * SMOOTH(14.0f);
+        if (fabsf(foot_target - g_foot_shift) < 0.002f) g_foot_shift = foot_target;
+    }
 
     clamp_tab(g_tab);
     g_scroll[g_tab] += ((float)g_top[g_tab] - g_scroll[g_tab]) * SMOOTH(16.0f);

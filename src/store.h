@@ -15,6 +15,16 @@ int store_fav_toggle(const track_t *t);
 int store_hist_count(void);
 int store_hist_get(int i, track_t *t);
 void store_hist_push(const track_t *t);
+void store_hist_clear(void);
+
+enum {
+    OPT_HINTS = 0,
+    OPT_RADIO,
+    OPT_COUNT
+};
+
+int store_opt(int id);
+void store_opt_set(int id, int v);
 
 int store_pl_count(void);
 int store_pl_name(int pl, char *out, size_t cap);
@@ -31,6 +41,7 @@ int store_dl_get(int i, track_t *t);
 int store_dl_find(const char *id, int *frames, int *dur_ms);
 void store_dl_add(const track_t *t, int frames, int dur_ms);
 void store_dl_remove(const char *id);
+void store_dl_clear(void);
 void store_dl_path(const char *id, const char *ext, char *out, size_t cap);
 
 #endif

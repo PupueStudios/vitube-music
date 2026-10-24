@@ -12,6 +12,7 @@
 #define HIST_PATH DATA_DIR "/history.json"
 #define PL_PATH DATA_DIR "/playlists.json"
 #define DL_PATH DATA_DIR "/downloads.json"
+#define OPT_PATH DATA_DIR "/settings.json"
 #define FAV_MAX 1000
 #define HIST_MAX 100
 #define PL_MAX 64
@@ -44,6 +45,7 @@ static playlist_t g_pl[PL_MAX];
 static int g_pln;
 static dl_item_t *g_dl;
 static int g_dln;
+static volatile int g_opt[OPT_COUNT] = {1, 1};
 static mutex_t g_mx;
 
 static json_t *track_to_json(const track_t *t) {
@@ -226,11 +228,68 @@ static void dl_load(void) {
     json_decref(arr);
 }
 
+static const char *const OPT_KEYS[OPT_COUNT] = {"hints", "radio"};
+
+static void opt_save(void) {
+    json_t *o = json_object();
+    for (int i = 0; i < OPT_COUNT; i++) json_object_set_new(o, OPT_KEYS[i], json_boolean(g_opt[i]));
+    json_dump_file(o, OPT_PATH, JSON_COMPACT);
+    json_decref(o);
+}
+
+static void opt_load(void) {
+    json_error_t e;
+    json_t *o = json_load_file(OPT_PATH, 0, &e);
+    if (!o) return;
+    for (int i = 0; i < OPT_COUNT; i++) {
+        json_t *v = json_object_get(o, OPT_KEYS[i]);
+        if (json_is_boolean(v)) g_opt[i] = json_is_true(v) ? 1 : 0;
+    }
+    json_decref(o);
+}
+
+int store_opt(int id) {
+    if (id < 0 || id >= OPT_COUNT) return 0;
+    return g_opt[id];
+}
+
+void store_opt_set(int id, int v) {
+    if (id < 0 || id >= OPT_COUNT) return;
+    mx_lock(&g_mx);
+    g_opt[id] = v ? 1 : 0;
+    opt_save();
+    mx_unlock(&g_mx);
+}
+
+void store_hist_clear(void) {
+    mx_lock(&g_mx);
+    g_hist.n = 0;
+    list_save(&g_hist, HIST_PATH);
+    mx_unlock(&g_mx);
+}
+
+void store_dl_clear(void) {
+    mx_lock(&g_mx);
+    if (g_dl) {
+        for (int i = 0; i < g_dln; i++) {
+            char path[96];
+            store_dl_path(g_dl[i].t.id, "aac", path, sizeof path);
+            sceIoRemove(path);
+            store_dl_path(g_dl[i].t.id, "jpg", path, sizeof path);
+            sceIoRemove(path);
+        }
+        g_dln = 0;
+        dl_save();
+    }
+    mx_unlock(&g_mx);
+}
+
 void store_init(void) {
     mx_init(&g_mx, "ytm_store");
     sceIoMkdir(DL_DIR, 0777);
     list_load(&g_fav, FAV_PATH, FAV_MAX);
     list_load(&g_hist, HIST_PATH, HIST_MAX);
+    opt_load();
     pl_load();
     dl_load();
     log_msg("store: %d favorites, %d history, %d playlists, %d downloads", g_fav.n, g_hist.n, g_pln, g_dln);

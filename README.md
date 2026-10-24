@@ -33,6 +33,7 @@ Everything lives in `ux0:data/vitube-music/`:
   ```
   `hl` and `gl` are the language and region sent to YouTube. `insecure_tls` turns off certificate checking and is only meant for diagnosing certificate problems.
 - `favorites.json` and `history.json` are your lists.
+- `settings.json` stores the switches from the Options tab.
 - `playlists.json` holds your playlists and `downloads.json` is the index of downloaded songs. The audio itself is in `downloads/` (one `.aac` file and one cover `.jpg` per song).
 - `cacert.pem` is optional. If it's there, it replaces the bundled CA list.
 - `log.txt` records what happened (HTTP status codes, decode errors and so on). Attach it when opening an issue.
