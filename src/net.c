@@ -6,6 +6,7 @@
 
 #include <curl/curl.h>
 #include <psp2/net/net.h>
+#include <psp2/kernel/rng.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/net/netctl.h>
 #include <psp2/sysmodule.h>
@@ -34,7 +35,58 @@ static int g_net_ready;
 extern void CRYPTO_set_locking_callback(void (*func)(int mode, int type, const char *file, int line));
 extern void CRYPTO_set_id_callback(unsigned long (*func)(void));
 
+typedef struct {
+    void (*seed)(const void *buf, int num);
+    int (*bytes)(unsigned char *buf, int num);
+    void (*cleanup)(void);
+    void (*add)(const void *buf, int num, double entropy);
+    int (*pseudorand)(unsigned char *buf, int num);
+    int (*status)(void);
+} ssl_rand_method_t;
+
+extern int RAND_set_rand_method(const ssl_rand_method_t *meth);
+
 static mutex_t g_ssl_locks[SSL_LOCKS];
+
+static void ssl_rand_seed(const void *buf, int num) {
+    (void)buf;
+    (void)num;
+}
+
+static void ssl_rand_add(const void *buf, int num, double entropy) {
+    (void)buf;
+    (void)num;
+    (void)entropy;
+}
+
+static void ssl_rand_cleanup(void) {}
+
+static int ssl_rand_bytes(unsigned char *buf, int num) {
+    if (num < 0) return 0;
+    int off = 0;
+    while (off < num) {
+        int chunk = num - off;
+        if (chunk > 32) chunk = 32;
+        int ok = 0;
+        for (int tries = 0; tries < 4 && !ok; tries++) ok = sceKernelGetRandomNumber(buf + off, (SceSize)chunk) >= 0;
+        if (!ok) return 0;
+        off += chunk;
+    }
+    return 1;
+}
+
+static int ssl_rand_status(void) {
+    return 1;
+}
+
+static const ssl_rand_method_t g_ssl_rand = {
+    ssl_rand_seed,
+    ssl_rand_bytes,
+    ssl_rand_cleanup,
+    ssl_rand_add,
+    ssl_rand_bytes,
+    ssl_rand_status,
+};
 
 static void ssl_locking_cb(int mode, int type, const char *file, int line) {
     (void)file;
@@ -55,6 +107,7 @@ static void ssl_threading_init(void) {
     for (int i = 0; i < SSL_LOCKS; i++) mx_init(&g_ssl_locks[i], "ytm_ssl");
     CRYPTO_set_id_callback(ssl_thread_id_cb);
     CRYPTO_set_locking_callback(ssl_locking_cb);
+    RAND_set_rand_method(&g_ssl_rand);
 }
 
 int net_init(int insecure) {

@@ -166,7 +166,7 @@ static int worker(SceSize args, void *argp) {
 void thumbs_init(void) {
     mx_init(&T.mx, "ytm_thumbs");
     for (int i = 0; i < FETCH_THREADS; i++) {
-        g_th[i] = sceKernelCreateThread("ytm_thumb", worker, 0x10000100, 0x20000, 0, 0, NULL);
+        g_th[i] = sceKernelCreateThread("ytm_thumb", worker, 0x10000100, 0x40000, 0, 0, NULL);
         if (g_th[i] >= 0) sceKernelStartThread(g_th[i], 0, NULL);
         else log_msg("thumbs: thread create failed %08x", (unsigned)g_th[i]);
     }
