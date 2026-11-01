@@ -144,7 +144,7 @@ typedef struct {
 
 static const char *const TAB_NAMES[TAB_COUNT] = {"Search", "Queue", "Favorites", "Playlists", "Offline", "History", "Options"};
 
-static vita2d_pgf *g_font;
+static vita2d_pvf *g_font;
 static GfxFont *g_ps;
 static vita2d_texture *g_glow;
 static vita2d_texture *g_logo;
@@ -359,16 +359,16 @@ static void fmt_time(char *out, size_t cap, int ms) {
     else snprintf(out, cap, "%d:%02d", s / 60, s % 60);
 }
 
-static float pgf_scale(int size) {
+static float font_scale(int size) {
     return 0.93f * (float)size / g_lh;
 }
 
 static float tw(int size, const char *s) {
-    return (float)vita2d_pgf_text_width(g_font, pgf_scale(size), s);
+    return (float)vita2d_pvf_text_width(g_font, font_scale(size), s);
 }
 
 static void tx(float x, float cy, int size, unsigned color, const char *s) {
-    vita2d_pgf_draw_text(g_font, (int)x, (int)(cy + (float)size * 0.33f), color, pgf_scale(size), s);
+    vita2d_pvf_draw_text(g_font, (int)x, (int)(cy + (float)size * 0.33f), color, font_scale(size), s);
 }
 
 static void tx_right(float xr, float cy, int size, unsigned color, const char *s) {
@@ -1880,21 +1880,20 @@ int ui_init(void) {
     vita2d_set_clear_color(COL_BG);
     vita2d_set_vblank_wait(1);
 
-    vita2d_system_pgf_config full[] = {
-        {SCE_FONT_LANGUAGE_KOREAN, in_hangul},
-        {SCE_FONT_LANGUAGE_JAPANESE, in_cjk},
-        {SCE_FONT_LANGUAGE_LATIN, NULL},
+    vita2d_system_pvf_config full[] = {
+        {SCE_PVF_LANGUAGE_K, in_hangul},
+        {SCE_PVF_LANGUAGE_J, in_cjk},
+        {SCE_PVF_LANGUAGE_LATIN, NULL},
     };
-    vita2d_system_pgf_config reduced[] = {
-        {SCE_FONT_LANGUAGE_JAPANESE, in_cjk},
-        {SCE_FONT_LANGUAGE_LATIN, NULL},
+    vita2d_system_pvf_config reduced[] = {
+        {SCE_PVF_LANGUAGE_J, in_cjk},
+        {SCE_PVF_LANGUAGE_LATIN, NULL},
     };
-    g_font = vita2d_load_system_pgf(3, full);
-    if (!g_font) g_font = vita2d_load_system_pgf(2, reduced);
-    if (!g_font) g_font = vita2d_load_default_pgf();
+    g_font = vita2d_load_system_pvf(3, full);
+    if (!g_font) g_font = vita2d_load_system_pvf(2, reduced);
+    if (!g_font) g_font = vita2d_load_default_pvf();
     if (!g_font) return -1;
-    int h = vita2d_pgf_text_height(g_font, 1.0f, "Ag");
-    if (h > 8 && h < 80) g_lh = (float)h;
+    g_lh = 17.0f;
     log_msg("font loaded, line height %.1f", g_lh);
 
     g_ps = gfx_font_load("app0:assets/PSButtons.ttf");
@@ -1967,6 +1966,6 @@ void ui_shutdown(void) {
     if (g_note) vita2d_free_texture(g_note);
     if (g_search) vita2d_free_texture(g_search);
     gfx_font_free(g_ps);
-    if (g_font) vita2d_free_pgf(g_font);
+    if (g_font) vita2d_free_pvf(g_font);
     vita2d_fini();
 }
